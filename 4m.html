@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <title>瓦片地图（极速优化版）</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden
+        }
+
+        canvas {
+            width: 100vw;
+            height: 100vh;
+            cursor: grab;
+            background: #000;
+            display: block;
+            /* 关键：消除画布留白 */
+        }
+    </style>
+</head>
+
+<body>
+    <canvas id="c"></canvas>
+    <script>
+        const c = document.getElementById('c');
+        const ctx = c.getContext('2d');
+        c.width = window.innerWidth;
+        c.height = window.innerHeight;
+        ctx.imageSmoothingEnabled = false;
+
+        // ==================== 配置 ====================
+        const tileSize = 256;
+        const xList = [14, 45, 76, 107, 138, 169, 200, 231, 262, 293, 324, 355, 386, 417];
+        const yList = [14, 45, 76, 107, 138, 169, 200, 231, 262, 293, 324, 355, 386, 417];
+
+        let scale = 5, ox = 0, oy = 0;
+        let drag = false, lastX, lastY;
+        let cache = {};
+        let loading = new Set();
+
+        // 【优化】只在必要时重绘，不疯狂渲染
+        let needRender = true;
+        // 【优化】requestAnimationFrame 锁，防止重复调用
+        let frame = null;
+
+        // ==================== 初始化居中 ====================
+        function fit() {
+            const w = xList.length * tileSize;
+            const h = yList.length * tileSize;
+            ox = (c.width - w * scale) / 2;
+            oy = (c.height - h * scale) / 2;
+            needRender = true;
+            renderLoop();
+        }
+
+        // 加限制：最大同时加载瓦片（关键防爆炸）
+        const MAX_CONCURRENT = 11;
+        let loadingCount = 0;
+
+        // ==================== 优化+限流+多线程+显存释放 ====================
+        function loadVisibleTiles() {
+            // 并发过载直接跳过，防止卡死
+            if (loadingCount >= MAX_CONCURRENT) return;
+
+            const scaledTile = tileSize * scale;
+            const screenL = -ox / scaledTile;
+            const screenT = -oy / scaledTile;
+            const screenR = (c.width - ox) / scaledTile + 1;
+            const screenB = (c.height - oy) / scaledTile + 1;
+
+            const minCol = Math.max(0, Math.floor(screenL));
+            const maxCol = Math.min(xList.length - 1, Math.ceil(screenR));
+            const minRow = Math.max(0, Math.floor(screenT));
+            const maxRow = Math.min(yList.length - 1, Math.ceil(screenB));
+
+            // 1. 清理屏幕外旧瓦片：释放显存（解决缩放越用越卡）
+            Object.keys(cache).forEach(key => {
+                const [cx, cy] = key.split("_").map(Number);
+                const col = xList.indexOf(cx);
+                const row = yList.indexOf(cy);
+                if (col < minCol || col > maxCol || row < minRow || row > maxRow) {
+                    // 释放bitmap内存
+                    if (cache[key].close) cache[key].close();
+                    delete cache[key];
+                }
+            });
+
+            // 2. 只加载可见 + 控制并发数量
+            for (let col = minCol; col <= maxCol; col++) {
+                for (let row = minRow; row <= maxRow; row++) {
+                    if (loadingCount >= MAX_CONCURRENT) return;
+
+                    const x = xList[col];
+                    const y = yList[row];
+                    const key = `${x}_${y}`;
+                    if (cache[key] || loading.has(key)) continue;
+
+                    loading.add(key);
+                    loadingCount++;
+
+                    fetch(`./webp/map_${x}_${y}.webp`)
+                        .then(res => res.blob())
+                        .then(blob => createImageBitmap(blob))
+                        .then(bitmap => {
+                            cache[key] = bitmap;
+                            needRender = true;
+                            renderLoop();
+                        })
+                        .catch(() => { })
+                        .finally(() => {
+                            loading.delete(key);
+                            loadingCount--;
+                        });
+                }
+            }
+        }
+
+        // ==================== 高效渲染循环 ====================
+        function renderLoop() {
+            if (frame) cancelAnimationFrame(frame);
+            frame = requestAnimationFrame(render);
+        }
+        let loadTimer = null;
+
+        function render() {
+            if (!needRender) return;
+            needRender = false;
+
+            ctx.clearRect(0, 0, c.width, c.height);
+            // 在 render 顶部加：
+            clearTimeout(loadTimer);
+            loadTimer = setTimeout(() => {
+                loadVisibleTiles();
+            }, 80);
+
+            const scaledTile = tileSize * scale;
+            const screenL = -ox / scaledTile;
+            const screenT = -oy / scaledTile;
+            const screenR = (c.width - ox) / scaledTile + 1;
+            const screenB = (c.height - oy) / scaledTile + 1;
+
+            const minCol = Math.max(0, Math.floor(screenL));
+            const maxCol = Math.min(xList.length - 1, Math.ceil(screenR));
+            const minRow = Math.max(0, Math.floor(screenT));
+            const maxRow = Math.min(yList.length - 1, Math.ceil(screenB));
+
+            // 只绘制可见区域！！！
+            for (let col = minCol; col <= maxCol; col++) {
+                for (let row = minRow; row <= maxRow; row++) {
+                    const x = xList[col];
+                    const y = yList[row];
+                    const key = `${x}_${y}`;
+                    const img = cache[key];
+                    if (!img) continue;
+
+                    const tx = Math.floor(col * scaledTile + ox);
+                    const ty = Math.floor(row * scaledTile + oy);
+                    const tw = Math.ceil(scaledTile + 1);
+                    const th = tw;
+
+                    ctx.drawImage(img, tx, ty, tw, th);
+                }
+            }
+        }
+
+        // ==================== 交互事件（极致节流） ====================
+        c.onmousedown = e => {
+            drag = true;
+            lastX = e.x;
+            lastY = e.y;
+            c.style.cursor = "grabbing";
+        };
+
+        document.onmousemove = e => {
+            if (!drag) return;
+            ox += e.x - lastX;
+            oy += e.y - lastY;
+            lastX = e.x;
+            lastY = e.y;
+            needRender = true;
+            renderLoop();
+        };
+
+        document.onmouseup = () => {
+            drag = false;
+            c.style.cursor = "grab";
+        };
+
+        c.onwheel = e => {
+            e.preventDefault();
+            const r = c.getBoundingClientRect();
+            const mx = e.clientX - r.left;
+            const my = e.clientY - r.top;
+            const ns = scale * (e.deltaY < 0 ? 1.25 : 0.8);
+
+            if (ns < 1 || ns > 200) return;
+            ox = mx - (mx - ox) * ns / scale;
+            oy = my - (my - oy) * ns / scale;
+            scale = ns;
+
+            needRender = true;
+            renderLoop();
+        };
+
+        fit();
+    </script>
+</body>
+
+</html>
