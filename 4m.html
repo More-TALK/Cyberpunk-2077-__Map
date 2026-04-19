@@ -195,7 +195,7 @@
             const my = e.clientY - r.top;
             const ns = scale * (e.deltaY < 0 ? 1.25 : 0.8);
 
-            if (ns < 1 || ns > 200) return;
+            if (ns < 0.1 || ns > 200) return;
             ox = mx - (mx - ox) * ns / scale;
             oy = my - (my - oy) * ns / scale;
             scale = ns;
